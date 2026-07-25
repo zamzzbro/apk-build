@@ -1,0 +1,125 @@
+name: Flutter APK Builder
+
+# Workflow ini dipicu oleh aplikasi Flutter APK Builder melalui
+# GitHub REST API (workflow_dispatch) setelah project ZIP user
+# selesai diupload ke server backend.
+#
+# Alur:
+# 1. Checkout repo runner ini (berisi workflow saja / project kosong).
+# 2. Download project ZIP dari URL yang dikirim aplikasi (input: project_url).
+# 3. Extract ZIP ke root kerja.
+# 4. Setup Flutter (channel stable, versi terbaru).
+# 5. flutter pub get.
+# 6. flutter build apk --release.
+# 7. flutter build appbundle --release.
+# 8. Upload APK & AAB sebagai artifact yang bisa diunduh aplikasi.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_url:
+        description: "URL download ZIP project Flutter yang akan dibuild"
+        required: true
+        type: string
+      build_name:
+        description: "Nama versi build (opsional, contoh 1.0.0)"
+        required: false
+        default: "1.0.0"
+        type: string
+      build_number:
+        description: "Build number (opsional)"
+        required: false
+        default: "1"
+        type: string
+
+jobs:
+  build:
+    name: Build APK & AAB
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Runner Repository
+        uses: actions/checkout@v4
+
+      - name: Download Project ZIP
+        run: |
+          echo "Mengunduh project dari: ${{ inputs.project_url }}"
+          curl -L -o project.zip "${{ inputs.project_url }}"
+          ls -lh project.zip
+
+      - name: Extract Project
+        run: |
+          mkdir -p flutter_project
+          unzip -q project.zip -d flutter_project
+          # Jika hasil extract memiliki 1 folder pembungkus, naikkan isinya ke root.
+          INNER_DIR=$(find flutter_project -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ -f "$INNER_DIR/pubspec.yaml" ]; then
+            mv "$INNER_DIR"/* flutter_project/
+          fi
+          test -f flutter_project/pubspec.yaml || (echo "pubspec.yaml tidak ditemukan di root ZIP!" && exit 1)
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Setup Flutter (Stable - Latest)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version-file: flutter_project/pubspec.yaml
+          cache: true
+
+      - name: Flutter Doctor
+        run: flutter doctor -v
+
+      - name: Flutter Pub Get
+        working-directory: flutter_project
+        run: flutter pub get
+
+      - name: Flutter Analyze
+        working-directory: flutter_project
+        run: flutter analyze || true
+
+      - name: Build APK Release
+        working-directory: flutter_project
+        run: |
+          flutter build apk --release \
+            --build-name=${{ inputs.build_name }} \
+            --build-number=${{ inputs.build_number }}
+
+      - name: Build AAB Release
+        working-directory: flutter_project
+        run: |
+          flutter build appbundle --release \
+            --build-name=${{ inputs.build_name }} \
+            --build-number=${{ inputs.build_number }}
+
+      - name: Rename Output Files
+        working-directory: flutter_project
+        run: |
+          mkdir -p ../output
+          cp build/app/outputs/flutter-apk/app-release.apk ../output/app-release.apk
+          cp build/app/outputs/bundle/release/app-release.aab ../output/app-release.aab
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: output/app-release.apk
+          retention-days: 14
+
+      - name: Upload AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: output/app-release.aab
+          retention-days: 14
+
+      - name: Build Summary
+        run: |
+          echo "### ✅ Build Selesai" >> $GITHUB_STEP_SUMMARY
+          echo "- APK: output/app-release.apk" >> $GITHUB_STEP_SUMMARY
+          echo "- AAB: output/app-release.aab" >> $GITHUB_STEP_SUMMARY
