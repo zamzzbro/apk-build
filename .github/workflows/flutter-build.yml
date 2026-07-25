@@ -1,125 +1,305 @@
-name: Flutter APK Builder
-
-# Workflow ini dipicu oleh aplikasi Flutter APK Builder melalui
-# GitHub REST API (workflow_dispatch) setelah project ZIP user
-# selesai diupload ke server backend.
-#
-# Alur:
-# 1. Checkout repo runner ini (berisi workflow saja / project kosong).
-# 2. Download project ZIP dari URL yang dikirim aplikasi (input: project_url).
-# 3. Extract ZIP ke root kerja.
-# 4. Setup Flutter (channel stable, versi terbaru).
-# 5. flutter pub get.
-# 6. flutter build apk --release.
-# 7. flutter build appbundle --release.
-# 8. Upload APK & AAB sebagai artifact yang bisa diunduh aplikasi.
+name: Flutter Build Bot
 
 on:
   workflow_dispatch:
     inputs:
-      project_url:
-        description: "URL download ZIP project Flutter yang akan dibuild"
-        required: true
-        type: string
-      build_name:
-        description: "Nama versi build (opsional, contoh 1.0.0)"
+      build_type:
+        description: 'Tipe build: apk-debug | apk-release | aab-release'
         required: false
-        default: "1.0.0"
-        type: string
-      build_number:
-        description: "Build number (opsional)"
+        default: 'apk-release'
+        type: choice
+        options:
+          - apk-debug
+          - apk-release
+          - aab-release
+      flutter_version:
+        description: 'Flutter version override (kosongkan untuk default)'
         required: false
-        default: "1"
+        default: ''
         type: string
+      release_tag:
+        description: 'Release tag dari bot Telegram'
+        required: false
+        default: ''
+        type: string
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'lib/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - 'android/**'
+      - 'assets/**'
 
 jobs:
   build:
-    name: Build APK & AAB
+    name: Build Flutter App
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - name: Checkout Runner Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Download Project ZIP
+      - name: 📥 Download Project ZIP from Bot Release
+        if: github.event.inputs.release_tag != ''
         run: |
-          echo "Mengunduh project dari: ${{ inputs.project_url }}"
-          curl -L -o project.zip "${{ inputs.project_url }}"
-          ls -lh project.zip
+          echo "📥 Mendownload project dari release: ${{ github.event.inputs.release_tag }}"
+          sleep 15
 
-      - name: Extract Project
-        run: |
-          mkdir -p flutter_project
-          unzip -q project.zip -d flutter_project
-          # Jika hasil extract memiliki 1 folder pembungkus, naikkan isinya ke root.
-          INNER_DIR=$(find flutter_project -mindepth 1 -maxdepth 1 -type d | head -n 1)
-          if [ -f "$INNER_DIR/pubspec.yaml" ]; then
-            mv "$INNER_DIR"/* flutter_project/
+          MAX_RETRY=5
+          RETRY=0
+          ASSET_URL=""
+
+          while [ $RETRY -lt $MAX_RETRY ]; do
+            echo "🔍 Attempt $((RETRY+1))/$MAX_RETRY: Mencari release..."
+            RELEASE_RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.event.inputs.release_tag }}")
+            RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq -r '.id')
+
+            if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+              ASSET_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.assets[0].browser_download_url')
+              if [ "$ASSET_URL" != "null" ] && [ -n "$ASSET_URL" ]; then
+                echo "✅ Asset ditemukan: $ASSET_URL"
+                break
+              fi
+            fi
+            sleep 10
+            RETRY=$((RETRY+1))
+          done
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "❌ Gagal mendapatkan asset setelah $MAX_RETRY kali percobaan!"
+            exit 1
           fi
-          test -f flutter_project/pubspec.yaml || (echo "pubspec.yaml tidak ditemukan di root ZIP!" && exit 1)
 
-      - name: Setup Java
+          curl -L -o project.zip "$ASSET_URL"
+          [ -f project.zip ] || { echo "❌ File ZIP gagal didownload!"; exit 1; }
+
+          mkdir -p project_extracted
+          unzip -o project.zip -d project_extracted/
+
+          if [ -f "project_extracted/pubspec.yaml" ]; then
+            cp -rf project_extracted/* .
+            cp -rf project_extracted/.* . 2>/dev/null || true
+          else
+            SUBFOLDER=$(find project_extracted -name "pubspec.yaml" -not -path "*/.*" | head -1)
+            if [ -n "$SUBFOLDER" ]; then
+              PROJECT_DIR=$(dirname "$SUBFOLDER")
+              cp -rf "$PROJECT_DIR"/* .
+              cp -rf "$PROJECT_DIR"/.* . 2>/dev/null || true
+            else
+              echo "❌ pubspec.yaml TIDAK DITEMUKAN!"
+              exit 1
+            fi
+          fi
+
+          rm -rf project_extracted project.zip
+          ls -la
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "zulu"
-          java-version: "17"
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
 
-      - name: Setup Flutter (Stable - Latest)
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: "stable"
-          flutter-version-file: flutter_project/pubspec.yaml
+          flutter-version: '3.32.8'
+          channel: 'stable'
           cache: true
 
-      - name: Flutter Doctor
-        run: flutter doctor -v
+      - name: 🎨 Regenerate Launcher Icons
+        run: |
+          if ! command -v convert >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+          fi
+
+          SOURCE_ICON=""
+          for f in assets/icon/icon.jpg assets/icon/icon.png assets/icon/icon.webp; do
+            [ -f "$f" ] && SOURCE_ICON="$f" && break
+          done
+
+          if [ -n "$SOURCE_ICON" ]; then
+            find android/app/src/main/res -name "ic_launcher*" -type f -delete
+            declare -A SIZES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
+            for density in "${!SIZES[@]}"; do
+              S=${SIZES[$density]}
+              mkdir -p "android/app/src/main/res/mipmap-${density}"
+              convert "$SOURCE_ICON" -resize ${S}x${S} -gravity center -extent ${S}x${S} \
+                "android/app/src/main/res/mipmap-${density}/ic_launcher.png"
+            done
+
+            mkdir -p android/app/src/main/res/mipmap-anydpi-v26
+            convert "$SOURCE_ICON" -resize 108x108 -gravity center -extent 108x108 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_background.png
+            convert "$SOURCE_ICON" -resize 72x72 -gravity center -extent 108x108 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png
+
+            cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@mipmap/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XMLEOF
+          else
+            for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+              case $density in
+                mdpi) SIZE="48x48" ;; hdpi) SIZE="72x72" ;; xhdpi) SIZE="96x96" ;;
+                xxhdpi) SIZE="144x144" ;; xxxhdpi) SIZE="192x192" ;;
+              esac
+              OUTPUT_DIR="android/app/src/main/res/mipmap-${density}"
+              mkdir -p "$OUTPUT_DIR"
+              convert -size "$SIZE" xc:'#2196F3' -fill white -gravity center -pointsize 24 -annotate 0 "App" "$OUTPUT_DIR/ic_launcher.png"
+            done
+          fi
+
+      - name: 🧹 Clean Icon Resources
+        run: |
+          find android/app/src/main/res -type f \( \
+            -name "ic_launcher.jpg" -o -name "ic_launcher.webp" -o -name "ic_launcher.gif" -o -name "ic_launcher.bmp" -o \
+            -name "ic_launcher_round.jpg" -o -name "ic_launcher_round.webp" -o -name "ic_launcher_round.gif" -o \
+            -name "ic_launcher_foreground.jpg" -o -name "ic_launcher_foreground.webp" -o \
+            -name "ic_launcher_background.jpg" -o -name "ic_launcher_background.webp" \
+          \) -delete 2>/dev/null || true
+          find android/app/src/main/res -name "ic_launcher*" -type f -size 0 -delete 2>/dev/null || true
+
+      - name: 🔍 Validate Android Resources
+        run: |
+          ERROR_FOUND=0
+          for png in $(find android/app/src/main/res -name "*.png" -type f); do
+            SIZE=$(stat -c%s "$png" 2>/dev/null || echo 0)
+            if [ "$SIZE" -eq 0 ]; then
+              rm -f "$png"; ERROR_FOUND=1; continue
+            fi
+            if command -v identify >/dev/null 2>&1 && ! identify "$png" >/dev/null 2>&1; then
+              convert -size 48x48 xc:'#2196F3' "$png" 2>/dev/null || rm -f "$png"
+              ERROR_FOUND=1
+            fi
+          done
+          for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            [ -f "android/app/src/main/res/mipmap-${density}/ic_launcher.png" ] || ERROR_FOUND=1
+          done
+          [ $ERROR_FOUND -eq 1 ] && echo "⚠️ Beberapa resource dibetulkan/dihapus" || echo "✅ Semua resource valid"
+
+      - name: Fix Kotlin Version Compatibility
+        run: |
+          BUILD_GRADLE="android/build.gradle"
+          if [ -f "$BUILD_GRADLE" ]; then
+            if grep -q "kotlin_version" "$BUILD_GRADLE"; then
+              sed -i "s/ext\.kotlin_version = '[^']*'/ext.kotlin_version = '1.9.10'/" "$BUILD_GRADLE"
+            else
+              sed -i "/buildscript {/a\\    ext.kotlin_version = '1.9.10'" "$BUILD_GRADLE"
+            fi
+          fi
+
+      - name: 🔧 Fix minSdkVersion & AndroidManifest
+        run: |
+          find android -name "build.gradle" -o -name "build.gradle.kts" | while read f; do
+            sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/g' "$f"
+            sed -i 's/minSdkVersion 21/minSdkVersion 23/g' "$f"
+            sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/g' "$f"
+            sed -i 's/minSdk(flutter.minSdkVersion)/minSdk(23)/g' "$f"
+            sed -i 's/minSdk = 21/minSdk = 23/g' "$f"
+            sed -i 's/minSdk 21/minSdk 23/g' "$f"
+          done
+
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q "xmlns:tools" "$MANIFEST"; then
+              sed -i 's/<manifest/<manifest xmlns:tools="http:\/\/schemas.android.com\/tools"/' "$MANIFEST"
+            fi
+          fi
+
+      - name: 🔧 Fix compileSdk & Assets
+        run: |
+          find android -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) | while read f; do
+            for v in 33 34 35; do
+              sed -i "s/compileSdkVersion\s*=\?\s*$v/compileSdkVersion 36/g" "$f"
+              sed -i "s/compileSdk\s*=\?\s*$v/compileSdk = 36/g" "$f"
+              sed -i "s/compileSdk($v)/compileSdk(36)/g" "$f"
+              sed -i "s/compileSdk\s\+$v/compileSdk 36/g" "$f"
+            done
+          done
+
+          for dir in assets assets/images assets/videos assets/audio assets/fonts assets/icons; do
+            mkdir -p "$dir"
+            [ -f "$dir/.gitkeep" ] || touch "$dir/.gitkeep"
+          done
+
+          if [ -f pubspec.yaml ]; then
+            grep -E "^\s+-\s+" pubspec.yaml | sed 's/.*- //' | while read asset; do
+              if echo "$asset" | grep -q "/$"; then
+                [ -d "$asset" ] || { mkdir -p "$asset"; touch "$asset/.gitkeep"; }
+              else
+                PARENT_DIR=$(dirname "$asset")
+                [ "$PARENT_DIR" != "." ] && [ ! -d "$PARENT_DIR" ] && { mkdir -p "$PARENT_DIR"; touch "$PARENT_DIR/.gitkeep"; }
+                [ -f "$asset" ] || touch "$asset"
+              fi
+            done
+          fi
+
+      - name: Set Build Type
+        id: build_info
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          [ -z "$BUILD_TYPE" ] && BUILD_TYPE="apk-debug"
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
 
       - name: Flutter Pub Get
-        working-directory: flutter_project
-        run: flutter pub get
+        run: |
+          flutter config --no-analytics
+          dart --disable-analytics
+          flutter pub get
 
-      - name: Flutter Analyze
-        working-directory: flutter_project
-        run: flutter analyze || true
+      - name: Build APK Debug
+        if: steps.build_info.outputs.build_type == 'apk-debug'
+        run: flutter build apk --debug --no-shrink --target-platform android-arm,android-arm64,android-x64
 
       - name: Build APK Release
-        working-directory: flutter_project
-        run: |
-          flutter build apk --release \
-            --build-name=${{ inputs.build_name }} \
-            --build-number=${{ inputs.build_number }}
+        if: steps.build_info.outputs.build_type == 'apk-release'
+        run: flutter build apk --release --obfuscate --split-debug-info=build/debug-info --target-platform android-arm,android-arm64,android-x64
 
       - name: Build AAB Release
-        working-directory: flutter_project
-        run: |
-          flutter build appbundle --release \
-            --build-name=${{ inputs.build_name }} \
-            --build-number=${{ inputs.build_number }}
+        if: steps.build_info.outputs.build_type == 'aab-release'
+        run: flutter build appbundle --release --obfuscate --split-debug-info=build/debug-info
 
-      - name: Rename Output Files
-        working-directory: flutter_project
+      - name: Prepare Output Files
         run: |
-          mkdir -p ../output
-          cp build/app/outputs/flutter-apk/app-release.apk ../output/app-release.apk
-          cp build/app/outputs/bundle/release/app-release.aab ../output/app-release.aab
+          mkdir -p output
+          BUILD_TYPE="${{ steps.build_info.outputs.build_type }}"
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          APP_NAME=$(grep '^name:' pubspec.yaml | awk '{print $2}' | tr -d '\r')
 
-      - name: Upload APK Artifact
+          if [ "$BUILD_TYPE" = "apk-debug" ]; then
+            APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" | head -1)
+            cp "$APK_PATH" "output/${APP_NAME}_debug_${TIMESTAMP}.apk"
+          elif [ "$BUILD_TYPE" = "apk-release" ]; then
+            APK_PATH=$(find build/app/outputs/flutter-apk -name "app-release.apk" | head -1)
+            cp "$APK_PATH" "output/${APP_NAME}_release_${TIMESTAMP}.apk"
+          elif [ "$BUILD_TYPE" = "aab-release" ]; then
+            AAB_PATH=$(find build/app/outputs/bundle/release -name "*.aab" | head -1)
+            cp "$AAB_PATH" "output/${APP_NAME}_release_${TIMESTAMP}.aab"
+          fi
+          ls -lh output/
+
+      - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
-          path: output/app-release.apk
-          retention-days: 14
-
-      - name: Upload AAB Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release-aab
-          path: output/app-release.aab
-          retention-days: 14
+          name: flutter-build-${{ steps.build_info.outputs.build_type }}-${{ github.run_number }}
+          path: output/
+          retention-days: 3
+          if-no-files-found: error
 
       - name: Build Summary
+        if: always()
         run: |
-          echo "### ✅ Build Selesai" >> $GITHUB_STEP_SUMMARY
-          echo "- APK: output/app-release.apk" >> $GITHUB_STEP_SUMMARY
-          echo "- AAB: output/app-release.aab" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Flutter Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Type | ${{ steps.build_info.outputs.build_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run Number | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
